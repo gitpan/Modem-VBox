@@ -4,29 +4,30 @@ use strict 'subs';
 use Carp;
 
 require Exporter;
-use Event qw(unloop one_event time unloop_all);
 use POSIX ':termios_h';
 use Fcntl;
+use Event qw(unloop one_event time unloop_all);
 use Event::Watcher qw(R W);
+use Time::HiRes qw/time/; # this is required(!)
 
 BEGIN { $^W=0 } # I'm fed up with bogus and unnecessary warnings nobody can turn off.
 
 @ISA = qw(Exporter);
 
-@_consts = qw();
+@_consts = qw(RING RUNG CONNECT BREAK EOTX);
 @_funcs = qw();
 
 @EXPORT = @_consts;
 @EXPORT_OK = @_funcs;
 %EXPORT_TAGS = (all => [@_consts,@_funcs], constants => \@_consts);
-$VERSION = '0.02';
+$VERSION = '0.04';
 
 # if debug is used, STDIN will be used for events and $play will be used to play messages
 $debug = 0;
 
 # hardcoded constants
 $HZ=8000;
-$FRAG=1024; # ~~ 8 Hz.
+$PFRAG=8192; # frag size for play_pause
 
 $ETX="\003";
 $DLE="\020";
@@ -36,6 +37,13 @@ $DC4="\024";
 sub VCON	(){ 1 }
 sub VTX		(){ 2 }
 sub VRX		(){ 4 }
+
+# event types
+sub RING	(){ -1 } # a single ring (+ count)
+sub RUNG	(){ -2 } # ring timeout
+sub CONNECT	(){ -3 } # a single ring (+ count)
+sub BREAK	(){ -4 } # break sequence detected
+sub EOTX	(){ -6 } # end of current transmissions
 
 sub slog {
    my $self=shift;
@@ -53,11 +61,14 @@ sub new {
    eval { $attr{speed}	||= &B115200 };
    eval { $attr{speed}	||= &B57600  };
    $attr{speed}		||= B38400;
+   $attr{timeout}	||= 2;
 
    $attr{dropdtrtime}	||= 0.25; # dtr timeout
    $attr{modeminit}	||= "ATZ";
    $attr{ringto}	||= 5; # ring-timeout
    $attr{rings}		||= 3; # number of rings
+
+   $attr{ring_cb}	||= sub { };
 
    my $self = bless \%attr,$class;
 
@@ -72,34 +83,47 @@ sub new {
    $self->{tio}->getattr($self->{fileno});
 
    $self->{inwatcher}=Event->io(
-      e_poll => R,
-      e_fd => $self->{fileno},
-      e_desc => "Modem input for $self->{line}",
-      e_cb => sub {
+      poll => R,
+      fd => $self->{fileno},
+      desc => "Modem input for $self->{line}",
+      cb => sub {
          my $ri = \($self->{rawinput});
-         if (sysread($self->{fh},$$ri,8192,length($$ri)) == 0) {
-            $self->slog(1,"short read, probably remote hangup");
-            $self->{state} &= ~(VCON|VRX|VTX);
-            $self->hangup;
+         if (sysread($self->{fh}, $$ri, 8192, length $$ri) == 0) {
+            $self->slog(1, "short read, probably remote hangup");
+            if ($self->connected) {
+               $self->{state} &= ~(VCON|VRX|VTX);
+               $self->hangup;
+            } else {
+               $self->slog(0, "WOAW, short read while in command mode, exiting");
+               exit (0);
+            }
          } else {
             if ($self->{state} & VRX) {
                my $changed;
                # must use a two-step process
                $$ri =~ s/^((?:[^$DLE]+|$DLE[^$ETX$DC4])*)//o;
-               my $data=$1;
+               my $data = $1;
                $data =~ s{$DLE(.)}{
                   if ($1 eq $DLE) {
                      $DLE;
                   } else {
-                     $self->{break}.=$1;
-                     print "got dle seq ($1)\n";#d#
+                     $self->{break} .= $1;
+                     #print "got dle seq ($1)\n";#d#
                      $changed=1;
                      "";
                   }
                }ego;
-               if ($$ri =~ s/^$DLE$ETX[\r\n]*VCON[^\r\n]*[\r\n]+//o) {
-                  $self->slog(3,"=> ETX, EO VRX");
+               $self->{record}->($data) if $self->{record};
+               if ($$ri =~ s/^$DLE$ETX//o) {
+                  $self->slog(3, "=> ETX, EO VTX|VRX");
                   $self->{state} &= ~VRX;
+                  if ($self->{state} & VTX) {
+                     $self->{state} &= ~VTX;
+                     delete $self->{play_queue};
+                     delete $self->{rawoutput};
+                     $self->modemwrite("$DLE$ETX");
+                  }
+                  $$ri =~ s/^[\r\n]*(?:VCON)?[\r\n]+//;
                }
                $self->check_break if $changed;
             }
@@ -116,14 +140,16 @@ sub new {
                      if (defined $oci) {
                         if ($oci ne $cid) {
                            $self->rung;
-                           $self->{ring}=0;
                         }
                      } else {
                         $self->{ring}=0;
                      }
-                     $self->{ringtowatcher}{e_at}=time+$self->{ringto};
-                     $self->{ringtowatcher}->resume;
-                     $self->ring(++$self->{ring});
+                     $self->{ringtowatcher}->stop;
+                     $self->{ringtowatcher}->again;
+                     $self->{ring}++;
+                     $self->{ring_cb}->($self->{ring}, $self->{callerid});
+                     $self->slog(1, "the telephone rings (#".($self->{ring})."), hurry! (callerid $self->{callerid})");
+                     $self->accept if $self->{ring} >= $self->{rings};
                   } elsif (/^RUNG\b/) {
                      $self->rung;
                   } elsif (/\S/) {
@@ -135,46 +161,62 @@ sub new {
       }
    );
    $self->{outwatcher}=Event->io(
-      e_poll => 0,
-      e_fd => $self->{fileno},
-      e_desc => "Modem sound output for $self->{line}",
-      e_cb => sub {
+      poll => W,
+      fd => $self->{fileno},
+      desc => "Modem sound output for $self->{line}",
+      cb => sub {
          my $l;
-         my $o = \($self->{rawoutput});
-         if(!$$o) {
+         if (!$self->{rawoutput}) {
             my $q = $self->{play_queue};
             if (@$q) {
                if (ref \($q->[0]) eq "GLOB") {
                   my $n;
-                  $l=sysread $q->[0],$n,$FRAG;
-                  $n=~s/$DLE/$DLE$DLE/go;
-                  $$o.=$n;
-                  shift(@$q) if $l<=0;
+                  $l = sysread $q->[0], $self->{rawoutput}, $self->{FRAG};
+                  $self->{rawoutput} =~ s/$DLE/$DLE$DLE/go;
+                  if ($l <= 0) {
+                    $self->event(EOTX,scalar@$q);
+                    shift @$q;
+                  }
                } else {
-                  $$o=${shift(@$q)};
+                  $self->{rawoutput} = ${shift(@$q)};
                }
             } else {
-               $self->{outwatcher}{e_poll}=0;
+               $self->{outwatcher}->stop;
+               $self->event(EOTX, 0);
             }
          }
-         if ($$o) {
-            $l = syswrite($self->{fh},$$o);
-            substr($$o,0,$l)="" if $l>0;
+         if ($self->{rawoutput}) {
+            $l = syswrite $self->{fh}, $self->{rawoutput}, length $self->{rawoutput};
+            substr($self->{rawoutput}, 0, $l) = "" if $l > 0;
+            $l /= $self->{HZ}; #/
+            $self->{vtx_end} += $l;
+
+            # now throttle sound output(!), do not allow more than 0.01s overlap
+            $self->{outwatcher}->stop;
+            Event->timer(
+               at => $self->{vtx_end} - 0.01,
+               desc => "outwatcher data throttle",
+               cb => sub { $self->{outwatcher}->start;
+                           $_[0]->w->cancel }
+            );
          }
       }
    );
-   $self->{ringtowatcher}=Event->timer(
-      e_at => 1, # ignored, but must be set
-      e_desc => 'RING timeout detector',
-      e_cb => sub {
+   $self->{ringtowatcher} = Event->timer(
+      interval => $self->{ringto},
+      desc => "RING timeout watcher",
+      cb => sub {
          $self->rung;
-         $self->slog(1,"ring timeout, aborted connection");
+         $self->slog(1, "ring timeout, aborted connection");
       }
    );
-   $self->{ringtowatcher}->suspend;
 
-   $self->reset;
    $self->initialize;
+   $self->reset;
+
+   $self->{HZ}		||= $HZ;
+   $self->{FRAG}	||= 1024;
+
    $self;
 }
 
@@ -187,7 +229,8 @@ sub DESTROY {
 sub flush {
    my $self=shift;
    undef $self->{rawinput};
-   tcflush($self->{fileno},TCIOFLUSH);
+   tcflush $self->{fileno}, TCIOFLUSH;
+   my $buf; 1 while (sysread ($self->{fh},$buf,1024) > 0);
 }
 
 sub sane {
@@ -217,16 +260,18 @@ sub raw {
 sub reset {
    my $self=shift;
 
+   $self->initialize;
    $self->sane;
+   $self->{inwatcher}->stop;
 
    my $i=$self->{tio}->getispeed; my $o=$self->{tio}->getospeed;
    $self->{tio}->setispeed(B0); $self->{tio}->setospeed(B0);
 
    $self->{tio}->setattr($self->{fileno});
+   my $w = Event->timer(after => $self->{dropdtrtime},
+                        cb => sub { $_[0]->w->cancel; unloop },
+                        desc => 'Modem DTR drop timeout');
 
-   my $w = Event->timer(e_after => $self->{dropdtrtime},
-                        e_cb => sub { unloop },
-                        e_desc => 'Modem DTR drop timeout');
    $self->{tio}->setispeed($i); $self->{tio}->setospeed($o);
 
    $self->slog(3,"waiting for reset");
@@ -237,7 +282,7 @@ sub reset {
 
    $self->raw;
    $self->flush;
-   my $buf; 1 while (sysread ($self->{fh},$buf,1024) > 0);
+   $self->{inwatcher}->start;
 
    $self->command("AT")=~/^OK/ or croak "modem returned $self->{resp} to AT";
    $self->command($self->{modeminit})=~/^OK/ or croak "modem returned $self->{resp} to modem init string";
@@ -248,16 +293,29 @@ sub reset {
 # read a line
 sub modemline {
    my $self=shift;
-   one_event while(!@{$self->{modemresponse}});
+   my $timeout;
+   Event->timer (
+      after => $self->{timeout},
+      desc => "modem response timeout",
+      cb => sub { $timeout = 1;
+                  $_[0]->w->cancel }
+   );
+   one_event while !@{$self->{modemresponse}} && !$timeout;
    shift(@{$self->{modemresponse}});
+}
+
+sub modemwrite {
+   my $self = shift;
+   my $cmd = shift;
+   fcntl $self->{fh},F_SETFL,0;
+   syswrite $self->{fh}, $cmd, length $cmd;
+   fcntl $self->{fh},F_SETFL,O_NONBLOCK;
 }
 
 sub command {
    my $self = shift;
    my $cmd = shift;
-   fcntl $self->{fh},F_SETFL,0;
-   syswrite $self->{fh},"$cmd\r";
-   fcntl $self->{fh},F_SETFL,O_NONBLOCK;
+   $self->modemwrite("$cmd\r");
    $self->{resp} = $self->modemline;
    $self->{resp} = $self->modemline if $self->{resp} eq $cmd;
    $self->slog(2,"COMMAND($cmd) => ",$self->{resp});
@@ -267,28 +325,26 @@ sub command {
 sub initialize {
    my $self=shift;
    delete @{$self}{qw(play_queue state context break callerid
-                      rawinput rawoutput modemresponse)};
-   $self->{ringtowatcher}->suspend;
+                      rawinput rawoutput modemresponse record)};
+   $self->{ringtowatcher}->stop;
+   $self->{outwatcher}->stop;
    $self->{tio}->setispeed($self->{speed});
    $self->{tio}->setospeed($self->{speed});
+   $self->{ring}=0;
 }
 
 sub abort {
    my $self=shift;
-   $self->reset;
    $self->initialize;
+   $self->reset;
    $self->slog(1,"modem is now in listening state");
-}
-
-sub ring {
-   my $self=shift;
-   my $count=shift;
-   $self->slog(1,"the telephone rings (#$count), hurry! (callerid $self->{callerid})");
-   $self->accept if $count >= $self->{rings};
 }
 
 sub rung {
    my $self=shift;
+   $self->{ringtowatcher}->stop;
+   $self->{ring}=0;
+   $self->event(RUNG);
    $self->slog(1,"caller ($self->{callerid}) hung up before answering");
    delete $self->{callerid};
 }
@@ -304,36 +360,39 @@ sub loop {
 sub accept {
    my $self=shift;
    # DLE etc. handling
-   $self->{ringtowatcher}->suspend;
+   $self->{ringtowatcher}->stop;
    if ($self->command("ATA") =~ /^VCON/) {
-      $self->slog(2,"call accepted (callerid $self->{callerid})");
+      $self->slog(2, "call accepted (callerid $self->{callerid})");
       if ($self->command("AT+VTX+VRX") =~ /^CONNECT/) {
-         $self->raw;
-         $self->{state}|=VCON|VTX|VRX;
+         $self->{vtx_end} = time;
+         $self->{state} |= VCON|VTX|VRX;
+         delete $self->{event};
+         $self->event(CONNECT);
          $self->{connect_cb}->($self);
       } else {
+         $self->rung;
          $self->abort;
-         $self->slog(1,"modem did not respond with CONNECT to AT+VTX+VRX command");
+         $self->slog(1, "modem did not respond with CONNECT to AT+VTX+VRX command");
       }
    } else {
-      $self->slog(1,"modem did not respond with VCON to my ATA");
+      $self->slog(1, "modem did not respond with VCON to my ATA");
       $self->rung;
    }
 }
 
 sub check_break {
    my $self=shift;
-   while(my($k,$v)=each(%{$self->{context}})) {
-      if ($self->{break}=~/$k/) {
-         ref $v eq "CODE"
-         ? $v->($self,$self->{break})
-         : $self->event($v);
+   while(my($k,$v) = each %{$self->{context}}) {
+      if ($self->{break} =~ /$k/) {
+         ref $v eq "CODE" ? $v->($self, $self->{break})
+                          : $self->event (BREAK, $v);
       }
    }
 }
 
 sub hangup {
    my $self=shift;
+   $self->event(undef) if $self->connected;
    $self->abort;
 }
 
@@ -341,22 +400,31 @@ sub connected {
    $_[0]->{state} & VCON;
 }
 
+# return the number of pending events
+sub pending {
+   @{$_[0]->{event}};
+}
+
+sub wait_event {
+   my $self = shift;
+   one_event while !$self->pending;
+}
+
 sub event {
    my $self=shift;
-   $self->{event}=shift;
+   #$self->slog(3, "EVENT ".(scalar@_)." :@_:");
+   if (@_) {
+      push @{$self->{event}},
+         defined $_[0] ? bless [@_], "Modem::VBox::Event" 
+                       : undef;
+   } else {
+      $self->wait_event;
+      defined $self->{event}->[0] ? shift @{$self->{event}}
+                                  : undef;
+   }
 }
 
-sub play_flush {
-   my $self=shift;
-   tcflush($self->{fileno},TCOFLUSH);
-   @{$self->{play_queue}}=();
-   delete $self->{rawoutput};
-   print "flushing\n";
-   one_event;
-   print "flushed\n";
-}
-
-sub play_file {
+sub play_file($$) {
    my $self=shift;
    my $path=shift;
    my($fh)=local *FH;
@@ -364,25 +432,25 @@ sub play_file {
    $self->play_object($fh);
 }
 
-sub play_data {
+sub play_data($$) {
    my $self=shift;
    my $data=shift;
    $data=~s/$DLE/$DLE$DLE/go;
    $self->play_object(\$data);
 }
 
-sub play_object {
+sub play_object($$) {
    my $self=shift;
    my $obj=shift;
-   $self->{state} & VCON or croak "can't start plaing when not connected";
+   $self->{state} & VCON or return;
+   $self->{outwatcher}->start unless @{$self->{play_queue}};
    push(@{$self->{play_queue}},$obj);
-   $self->{outwatcher}->{e_poll} = W;
 }
 
-sub play_pause {
+sub play_pause($$) {
    my $self=shift;
-   my $len = int($HZ*$_[0]+0.999);
-   my $k8  = "\xFE" x $FRAG;
+   my $len = int($self->{HZ}*$_[0]+0.999);
+   my $k8  = "\xFE" x $PFRAG;
    while ($len>length($k8)) {
       $self->play_object(\$k8);
       $len-=length($k8);
@@ -390,28 +458,54 @@ sub play_pause {
    $self->play_object(\("\xFE" x $len));
 }
 
-sub play_count {
+sub play_count($) {
    scalar @{$_[0]->{play_queue}};
 }
 
-# wait until one file has been played
-sub play_wait {
+sub play_flush($) {
    my $self=shift;
-   my $pcount = $self->play_count;
-   delete $self->{event};
-   if ($pcount) {
-      do { 
-         one_event;
-      } while $pcount == $self->play_count
-           && !exists $self->{event};
-   }
-   delete $self->{event};
+   #tcflush $self->{fileno}, TCOFLUSH;
+   @{$self->{play_queue}} = ();
+   delete $self->{rawoutput};
+   one_event;
 }
 
-sub context {
+sub play_drain($) {
    my $self=shift;
-   bless [$self,%{$self->{context}}],"Modem::VBox::context";
+   my $waiting = 1;
+   one_event while $self->play_count;
+   Event->timer(at => $self->{vtx_end},
+                desc => "play_drain timer",
+                cb => sub { $waiting = 0;
+                            $_[0]->w->cancel }
+               );
+   one_event while $waiting;
 }
+
+sub record($$) {
+   my $self = shift;
+   $self->{record} = shift;
+}
+
+sub record_file($$) {
+   my $self = shift;
+   my $fh = shift;
+   $self->record (sub { print $fh $_[0] });
+}
+
+sub callerid($) { $_[0]->{callerid} }
+
+sub context($) {
+   my $self=shift;
+   bless [$self, {%{$self->{context}}}], "Modem::VBox::context";
+}
+
+package Modem::VBox::Event;
+
+sub type($$)	{ $_[0]->[0] == $_[1] }
+sub isbreak($)	{ $_[0]->[0] == Modem::VBox::BREAK }
+sub iseotx($;$)	{ $_[0]->[0] == Modem::VBox::EOTX && ( @_ < 2 || $_[1] >= $_[0]->[1] ) }
+sub data($)	{ $_[0]->[1] }
 
 package Modem::VBox::context;
 
@@ -459,7 +553,7 @@ Modem::VBox - Perl module for creation of voiceboxes.
 
 =head1 DESCRIPTION
 
-Oh well ;) Not written yet! An example script is included in the distro, though.
+Oh well ;) Not written yet! An example script (C<vbox>) is included in the distro, though.
 
 =head1 AUTHOR
 
