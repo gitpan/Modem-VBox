@@ -1,0 +1,57 @@
+#!/usr/bin/perl
+
+use Modem::VBox;
+
+#eval {
+#   require NetServer::ProcessTop;
+#   NetServer::ProcessTop->new(7000);
+#};
+
+$|=1;
+
+$BASE="/var/spool/vbox";
+$MSG="$BASE/messages";
+
+$Modem::VBox::debug=9;
+
+$v = new Modem::VBox
+   line => $ARGV[0] || "/dev/ttyI0",
+   modeminit => 'ATZ&B512&E9377344S13.4=0S13.2=1S13.6=0+FCLASS=8',
+   rings => 2, # connect after 5 rings
+   connect_cb => \&main_menu;
+
+$v->loop;
+
+sub record_menu {
+   my $context = $v->context->clr;
+   $v->play_file("$MSG/record");
+   $v->play_wait while $v->play_count;
+}
+
+sub music_menu {
+   my $context = $v->context->clr;
+   $v->play_file("$MSG/sm");
+   $v->play_wait while $v->play_count;
+}
+
+sub main_menu {
+   my $context = $v->context->set(
+      "1\$" => [\&record_menu],
+      "2\$" => [\&music_menu],
+   );
+   my $event;
+   $v->play_file("$MSG/welcome"); $v->play_pause(0.2);
+   while($v->connected) {
+      if ($v->play_count<2) {
+         print "adding help to queue\n";
+         $v->play_file("$MSG/help");
+         $v->play_pause(1);
+      }
+      if ($event = $v->play_wait) {
+         $v->play_flush;
+         $v->play_pause(0.5);
+         $event->[0]->();
+      }
+   }
+}
+

@@ -1,0 +1,107 @@
+#!/usr/bin/perl
+
+use IO::Pty;
+use Event qw(loop);
+use Event::Watcher qw(R W);
+use Time::HiRes 'usleep';
+use IO::Handle;
+
+$p = new IO::Pty;
+$p->blocking(0);
+
+$PLAYULAW = "| sox -traw -r8000 -U -b - -tossdsp /dev/dsp";
+$RECULAW  = "sox -tossdsp -r8000 /dev/dsp -traw -U -b - |";
+
+# 0 AT
+# 1 playing
+# 2 recording
+
+$ETX="\003";
+$DLE="\020";
+$DC4="\024";
+
+$CPS=8000;
+
+print "please connect to ",$p->slave->ttyname,"\n";
+
+$|=1;
+
+$state=0;
+$sending=0;
+
+sub state {
+   print "switching from state $state to $_[0]\n";
+   $state=shift;
+   close SOUND;
+   if ($state==1) { open SOUND,$PLAYULAW or die };
+   if ($state==2) { open SOUND,$RECULAW  or die };
+   SOUND->autoflush(1);
+}
+
+Event->io(e_fd => fileno $p, e_poll => R|W, e_cb => sub {
+   my $self=shift;
+   my $l;
+   if ($self->{e_got} & R) {
+      $l = sysread $p,$input,1024,length($input);
+      if ($state==0) {
+         if ($input=~s/^([^\r\n]*)[\r\n]+//) {
+            $line=$1;
+            print "got command »$line«\n";
+            if ($line =~ /^ATA/) {
+               $output.="VCON\r\n";
+            } elsif ($line =~ /^AT\+VTX\+VRX/) {
+               $output.="CONNECT\r\n";
+               print "switching on voice *playback*\n";
+               state(1);
+               $sending=1;
+            } elsif ($line =~ /^AT/) {
+               $output.="OK\r\n";
+            }
+         }
+      } elsif ($state) {
+         $input=~s/^((?:[^$DLE]+|$DLE[^$ETX])*)//o;
+         my $data=$1;
+         $data=~s/$DLE$DLE/$DLE/go;
+         print SOUND $data if $state==1;
+         if ($input=~s/^$DLE$ETX//o) {
+            print "ETX received, terminating send\n";
+            state(0);
+         }
+      }
+   }
+   if ($self->{e_got} & W) {
+      if($state==1 && $sending) {
+         $output="\xFE" x 64 unless $output;
+      }
+      $l = syswrite $p,$output;
+      substr($output,0,$l)="" if $l>0;
+      usleep(0.1e-6);
+   }
+});
+
+Event->io(e_fd => 0, e_poll => R, e_cb => sub {
+   my $l=<STDIN>;
+   chomp $l;
+   if ($l=~/^r$/) {
+      $output.="RING\r\n";
+   } elsif ($l=~/^i$/) {
+      $output=$input="";
+      state(0);
+      print "initialized\n";
+   } elsif ($l=~/^h$/) {
+      $output="$DLE${ETX}VCON\r\n";
+      $sending=0;
+      print "sent ETX\n";
+   } elsif ($l=~/^s$/) {
+      unloop;
+   } elsif ($l=~/^[*0-9A-D#]+$/) {
+      print "sending touchtones for '$l'\n";
+      $l=~s/(.)/$DLE$1/g;
+      $output="$l$output";
+   }
+});
+
+# this actually uses polling(!)
+
+loop;
+
