@@ -21,7 +21,7 @@ BEGIN { $^W=0 } # I'm fed up with bogus and unnecessary warnings nobody can turn
 @EXPORT = @_consts;
 @EXPORT_OK = @_funcs;
 %EXPORT_TAGS = (all => [@_consts,@_funcs], constants => \@_consts);
-$VERSION = '0.05';
+$VERSION = '0.051';
 
 # if debug is used, STDIN will be used for events and $play will be used to play messages
 $debug = 0;
@@ -66,7 +66,7 @@ sub new {
 
    $attr{dropdtrtime}	||= 0.25; # dtr timeout
    $attr{modeminit}	||= "ATZ";
-   $attr{ringto}	||= 5; # ring-timeout
+   $attr{ringto}	||= 6; # ring-timeout
    $attr{rings}		||= 3; # number of rings
 
    $attr{ring_cb}	||= sub { };
@@ -573,7 +573,7 @@ Oh well ;) Not written yet! An example script (C<vbox>) is included in the distr
 
 =head1 AUTHOR
 
-Marc Lehmann <pcg@goof.com>.
+Marc Lehmann <schmorp@schmorp.de>.
 
 =head1 SEE ALSO
 

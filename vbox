@@ -1,19 +1,27 @@
-#!/usr/bin/perl
+#!/opt/bin/perl
 
 use Modem::VBox;
 use Sys::Syslog;
 
+require POSIX;
+require MIME::Entity;
+
 $SIG{HUP} = 'IGNORE';
 
-sub send_file {
-   my ($subject, $filename, $mailto) = @_;
-   if (fork == 0) {
-      require POSIX;
-      require MIME::Entity;
+$Modem::VBox::debug = 7;
 
+$MAILTO = "vbox\@plan9.de";
+$FROM = "vbox\@plan9.de";
+$SENDMAIL = "/usr/sbin/exim -oi -oem -f \Q$FROM\E \Q$MAILTO\E";
+
+use POSIX ();
+do "/root/s/popup.pl";
+
+sub send_file {
+   my ($subject, $filename) = @_;
+   #if (fork == 0) {
       $top = MIME::Entity->build(Type    =>"multipart/mixed",
-                                 From    => "vbox\@plan9.de",
-                                 To      => $mailto,
+                                 From    => $FROM,
                                  Subject => $subject);
 
       $top->attach(
@@ -22,11 +30,11 @@ sub send_file {
          Encoding    => "base64",
       );
 
-      open MAIL, "| /usr/sbin/exim -t -oi -oem" or die "open: $!";
+      open MAIL, "| $SENDMAIL" or die "open: $!";
       $top->print(\*MAIL);
       close MAIL;
-      POSIX::_exit(0);
-   }
+      #POSIX::_exit(0);
+   #}
 }
 
 #{
@@ -59,7 +67,7 @@ $v = new Modem::VBox
       my ($count, $cid) = @_;
       my ($name, $avon);
       if ($count == 1) {
-         fork == 0 and do { exec "/etc/rc.spinup"; exit };
+         fork or do { exec "/etc/rc.spinup"; exit };
          open PHONE, "</var/spool/vbox/phone" and do {
             my $pm = qr/^$cid\s+(.*)/;
             while(<PHONE>) {
@@ -85,8 +93,24 @@ $v = new Modem::VBox
          $v->{phone} = $cid;
          $v->{avon}  = $avon;
          $v->{name}  = $name;
-         system "DISPLAY=cerebro:0 exec /usr/X11/bin/xmessage -default 'okay' -nearmouse -timeout 60 '$cid\n$name\n$avon' &";
+         for my $node (qw(10.0.0.1 10.0.0.2 10.0.1.2)) {
+            # xmessage
+            if (fork == 0) {
+               eval { send_msg("root", $node, "$cid\n$name\n$avon") };
+               POSIX::_exit(0);
+            }
+            #-e "/var/run/$node.1" and
+            #   system "DISPLAY=$node:0 HOME=/root exec /usr/X11/bin/xmessage -default 'okay' -nearmouse -timeout 60 '$cid\n$name\n$avon' &";
+         }
          syslog "notice", "RING: $cid $name ($avon)";
+         if (open MAIL, "| $SENDMAIL") {
+            my $H;
+            $H .= "C" if -e "/var/run/cerebro.1";
+            $H .= "F" if -e "/var/run/fuji.1";
+            $H .= "M" if -e "/var/run/mobil.1";
+            print MAIL "From: $FROM\nTo: $MAILTO\nSubject: RING [$H] $cid $name ($avon)\n\n[$H] $cid $name ($avon)\n";
+            close MAIL;
+         }
       }
    };
 
@@ -102,7 +126,9 @@ sub not_valid {
 
 sub record_menu {
    my $context = $v->context->clr;
-   $v->play_file("$MSG/record");
+   $v->play_file(msg "aufnehmen");
+   $v->play_pause(0.2);
+   $v->play_file(msg "krakout");
    my $msgtime = time;
    my $savename = sprintf "$INC/%14.14lu-%8.8lu", $msgtime, $$;
    while(my $ev = $v->event) {
@@ -124,10 +150,14 @@ sub record_menu {
          print FILE $va;
          $v->play_drain;
          $v->record_file (*FILE);
-         do { } while $v->event;
+         print "BP1\n";#d#
+         1 while $v->event;
+         print "BP2\n";#d#
          close FILE;
+         print "BP3\n";#d#
 
-         send_file("MESG $v->{phone}=$v->{name} ($v->{avon})", $savename, "root\@plan9.de");
+         send_file("MESG $v->{phone}=$v->{name} ($v->{avon})", $savename);
+         print "BP4\n";#d#
          syslog "notice", "MESG- %s %s (%s)", $v->{phone}, $v->{name}, $v->{avon};
          return;
       }
@@ -138,7 +168,7 @@ sub music_menu {
    my $context = $v->context->set(
          "0\$" => 0,
    );
-   $v->play_file("$MSG/nyi"); $v->play_pause(1);
+   $v->play_file(msg ("nyi")); $v->play_pause(1);
    for(;;) {
       my $i = 1;
       for (
@@ -173,11 +203,12 @@ sub music_menu {
 sub main_menu {
    my $context = $v->context->set(
       "1\$" => [\&record_menu],
-      "2\$" => [\&music_menu],
+      #"2\$" => [\&music_menu],
       "[^12]+\$" => \&not_valid,
    );
    my $event;
-   $v->play_file("$MSG/welcome"); $v->play_pause(0.2);
+   $v->play_file(msg "giana"); $v->play_pause(0.2);
+   $v->play_file(msg "hallo"); $v->play_pause(0.2);
    while (my $ev = $v->event) {
       if ($ev->isbreak) {
          $v->play_flush;
@@ -187,8 +218,9 @@ sub main_menu {
       }
       
       if ($v->play_count <= 1) {
-         $v->play_file("$MSG/help");
-         $v->play_pause(1);
+         $v->play_file(msg "nachricht"); $v->play_pause(0.2);
+         $v->play_file(msg "email"); $v->play_pause(0.2);
+         $v->play_file(msg "endlos"); $v->play_pause(1);
       }
    }
 }

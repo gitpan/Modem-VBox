@@ -10,3 +10,4 @@ VBox.pm
 VBox.xs
 vbox
 emul
+META.yml                                 Module meta-data (added by MakeMaker)

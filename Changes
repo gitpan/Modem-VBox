@@ -1,5 +1,8 @@
 Revision history for Perl extension Modem::VBox
 
+0.051 Thu Mar  3 18:00:52 CET 2005
+	- change of contact address.
+
 0.05  Fri Oct  5 15:21:52 CEST 2001
 	- more bugfixes, do not exit on hangup, leave the
           event loop on hangup etc..
