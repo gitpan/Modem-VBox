@@ -35,6 +35,8 @@ $|=1;
 $state=0;
 $sending=0;
 
+sub clip0($) { $_[0] < 0 ? 0 : $_[0] }
+
 sub state {
    print "switching from state $state to $_[0]\n";
    $state=shift;
@@ -78,7 +80,7 @@ my $mr; $mr = Event->io(fd => fileno $p, poll => R, cb => sub {
       }
       # throttle the sound output... easier than I thought
       $mr->stop;
-      Event->timer(after => -0.1 + length ($data) / $CPS, cb => sub { $mr->start });
+      Event->timer(after => clip0(-0.1 + length ($data) / $CPS), cb => sub { $mr->start });
    }
 });
 
@@ -98,7 +100,7 @@ my $mw; $mw = Event->io(fd => fileno $p, poll => W, cb => sub {
    $l = syswrite $p, $output;
    substr ($output, 0, $l)="" if $l > 0;
    $mw->stop;
-   Event->timer(after => -0.001 + $l / $CPS, cb => sub { $mw->start });
+   Event->timer(after => clip0(-0.001 + $l / $CPS), cb => sub { $mw->start });
 });
 
 Event->io(fd => 0, poll => R, cb => sub {

@@ -2,6 +2,7 @@ package Modem::VBox;
 
 use strict 'subs';
 use Carp;
+use bytes;
 
 require Exporter;
 use POSIX ':termios_h';
@@ -20,7 +21,7 @@ BEGIN { $^W=0 } # I'm fed up with bogus and unnecessary warnings nobody can turn
 @EXPORT = @_consts;
 @EXPORT_OK = @_funcs;
 %EXPORT_TAGS = (all => [@_consts,@_funcs], constants => \@_consts);
-$VERSION = '0.04';
+$VERSION = '0.05';
 
 # if debug is used, STDIN will be used for events and $play will be used to play messages
 $debug = 0;
@@ -72,139 +73,10 @@ sub new {
 
    my $self = bless \%attr,$class;
 
-   $self->slog(3,"opening line");
-
-   $self->{fh}=local *FH;
-   sysopen $self->{fh},$attr{line},O_RDWR|O_NONBLOCK
-      or croak "unable to open device $attr{line} for r/w";
-   $self->{fileno}=fileno $self->{fh};
-
-   $self->{tio} = new POSIX::Termios;
-   $self->{tio}->getattr($self->{fileno});
-
-   $self->{inwatcher}=Event->io(
-      poll => R,
-      fd => $self->{fileno},
-      desc => "Modem input for $self->{line}",
-      cb => sub {
-         my $ri = \($self->{rawinput});
-         if (sysread($self->{fh}, $$ri, 8192, length $$ri) == 0) {
-            $self->slog(1, "short read, probably remote hangup");
-            if ($self->connected) {
-               $self->{state} &= ~(VCON|VRX|VTX);
-               $self->hangup;
-            } else {
-               $self->slog(0, "WOAW, short read while in command mode, exiting");
-               exit (0);
-            }
-         } else {
-            if ($self->{state} & VRX) {
-               my $changed;
-               # must use a two-step process
-               $$ri =~ s/^((?:[^$DLE]+|$DLE[^$ETX$DC4])*)//o;
-               my $data = $1;
-               $data =~ s{$DLE(.)}{
-                  if ($1 eq $DLE) {
-                     $DLE;
-                  } else {
-                     $self->{break} .= $1;
-                     #print "got dle seq ($1)\n";#d#
-                     $changed=1;
-                     "";
-                  }
-               }ego;
-               $self->{record}->($data) if $self->{record};
-               if ($$ri =~ s/^$DLE$ETX//o) {
-                  $self->slog(3, "=> ETX, EO VTX|VRX");
-                  $self->{state} &= ~VRX;
-                  if ($self->{state} & VTX) {
-                     $self->{state} &= ~VTX;
-                     delete $self->{play_queue};
-                     delete $self->{rawoutput};
-                     $self->modemwrite("$DLE$ETX");
-                  }
-                  $$ri =~ s/^[\r\n]*(?:VCON)?[\r\n]+//;
-               }
-               $self->check_break if $changed;
-            }
-            unless ($self->{state} & VRX) {
-               while ($$ri =~ s/^([^\r\n]*)[\r\n]+//) {
-                  local $_ = $1;
-                  if (/^CALLER NUMBER:\s+(\d+)$/) {
-                     $self->{_callerid}=$1;
-                     $self->slog(3,"incoming call has callerid $1");
-                  } elsif (/^RING\b/) {
-                     my $cid = delete $self->{_callerid} || "0";
-                     my $oci = $self->{callerid};
-                     $self->{callerid}=$cid;
-                     if (defined $oci) {
-                        if ($oci ne $cid) {
-                           $self->rung;
-                        }
-                     } else {
-                        $self->{ring}=0;
-                     }
-                     $self->{ringtowatcher}->stop;
-                     $self->{ringtowatcher}->again;
-                     $self->{ring}++;
-                     $self->{ring_cb}->($self->{ring}, $self->{callerid});
-                     $self->slog(1, "the telephone rings (#".($self->{ring})."), hurry! (callerid $self->{callerid})");
-                     $self->accept if $self->{ring} >= $self->{rings};
-                  } elsif (/^RUNG\b/) {
-                     $self->rung;
-                  } elsif (/\S/) {
-                     push(@{$self->{modemresponse}},$_);
-                  }
-               }
-            }
-         }
-      }
-   );
-   $self->{outwatcher}=Event->io(
-      poll => W,
-      fd => $self->{fileno},
-      desc => "Modem sound output for $self->{line}",
-      cb => sub {
-         my $l;
-         if (!$self->{rawoutput}) {
-            my $q = $self->{play_queue};
-            if (@$q) {
-               if (ref \($q->[0]) eq "GLOB") {
-                  my $n;
-                  $l = sysread $q->[0], $self->{rawoutput}, $self->{FRAG};
-                  $self->{rawoutput} =~ s/$DLE/$DLE$DLE/go;
-                  if ($l <= 0) {
-                    $self->event(EOTX,scalar@$q);
-                    shift @$q;
-                  }
-               } else {
-                  $self->{rawoutput} = ${shift(@$q)};
-               }
-            } else {
-               $self->{outwatcher}->stop;
-               $self->event(EOTX, 0);
-            }
-         }
-         if ($self->{rawoutput}) {
-            $l = syswrite $self->{fh}, $self->{rawoutput}, length $self->{rawoutput};
-            substr($self->{rawoutput}, 0, $l) = "" if $l > 0;
-            $l /= $self->{HZ}; #/
-            $self->{vtx_end} += $l;
-
-            # now throttle sound output(!), do not allow more than 0.01s overlap
-            $self->{outwatcher}->stop;
-            Event->timer(
-               at => $self->{vtx_end} - 0.01,
-               desc => "outwatcher data throttle",
-               cb => sub { $self->{outwatcher}->start;
-                           $_[0]->w->cancel }
-            );
-         }
-      }
-   );
    $self->{ringtowatcher} = Event->timer(
       interval => $self->{ringto},
       desc => "RING timeout watcher",
+      parked => 1,
       cb => sub {
          $self->rung;
          $self->slog(1, "ring timeout, aborted connection");
@@ -324,12 +196,151 @@ sub command {
 
 sub initialize {
    my $self=shift;
+
+   $self->{inwatcher}->cancel  if $self->{inwatcher};
+   $self->{outwatcher}->cancel if $self->{outwatcher};
+
    delete @{$self}{qw(play_queue state context break callerid
-                      rawinput rawoutput modemresponse record)};
-   $self->{ringtowatcher}->stop;
-   $self->{outwatcher}->stop;
+                      rawinput rawoutput modemresponse record
+                      inwatcher outwatcher tio fh)};
+
+   $self->slog(3,"opening line");
+
+   $self->{fh}=local *FH;
+   sysopen $self->{fh},$self->{line},O_RDWR|O_NONBLOCK
+      or croak "unable to open device $self->{line} for r/w";
+   $self->{fileno}=fileno $self->{fh};
+
+   $self->{tio} = new POSIX::Termios;
+   $self->{tio}->getattr($self->{fileno});
+
+   $self->{inwatcher}=Event->io(
+      poll => R,
+      fd => $self->{fileno},
+      desc => "Modem input for $self->{line}",
+      parked => 1,
+      cb => sub {
+         my $ri = \($self->{rawinput});
+         if (sysread($self->{fh}, $$ri, 8192, length $$ri) == 0) {
+            $self->slog(1, "short read, probably remote hangup");
+            if ($self->connected) {
+               #$self->{state} &= ~(VCON|VRX|VTX);
+               $self->hangup;
+            } else {
+               $self->slog(0, "WOAW, short read while in command mode, reinitialize");
+               $self->initialize;
+            }
+         } else {
+            if ($self->{state} & VRX) {
+               my $changed;
+               # must use a two-step process
+               $$ri =~ s/^((?:[^$DLE]+|$DLE[^$ETX$DC4])*)//o;
+               my $data = $1;
+               $data =~ s{$DLE(.)}{
+                  if ($1 eq $DLE) {
+                     $DLE;
+                  } else {
+                     $self->{break} .= $1;
+                     $changed=1;
+                     "";
+                  }
+               }ego;
+               $self->{record}->($data) if $self->{record};
+               if ($$ri =~ s/^$DLE$ETX//o) {
+                  $self->slog(3, "=> ETX, EO VTX|VRX");
+                  $self->{state} &= ~VRX;
+                  if ($self->{state} & VTX) {
+                     $self->{state} &= ~VTX;
+                     delete $self->{play_queue};
+                     delete $self->{rawoutput};
+                     $self->modemwrite("$DLE$ETX");
+                  }
+                  $$ri =~ s/^[\r\n]*(?:VCON)?[\r\n]+//;
+               }
+               $self->check_break if $changed;
+            }
+            unless ($self->{state} & VRX) {
+               while ($$ri =~ s/^([^\r\n]*)[\r\n]+//) {
+                  local $_ = $1;
+                  if (/^CALLER NUMBER:\s+(\d+)$/) {
+                     $self->{_callerid}=$1;
+                     $self->slog(3,"incoming call has callerid $1");
+                  } elsif (/^RING\b/) {
+                     my $cid = delete $self->{_callerid} || "0";
+                     my $oci = $self->{callerid};
+                     $self->{callerid}=$cid;
+                     if (defined $oci) {
+                        if ($oci ne $cid) {
+                           $self->rung;
+                        }
+                     } else {
+                        $self->{ring}=0;
+                     }
+                     $self->{ringtowatcher}->stop;
+                     $self->{ringtowatcher}->again;
+                     $self->{ring}++;
+                     $self->{ring_cb}->($self->{ring}, $self->{callerid});
+                     $self->slog(1, "the telephone rings (#".($self->{ring})."), hurry! (callerid $self->{callerid})");
+                     $self->accept if $self->{ring} >= $self->{rings};
+                  } elsif (/^RUNG\b/) {
+                     $self->rung;
+                  } elsif (/\S/) {
+                     push @{$self->{modemresponse}}, $_;
+                  }
+               }
+            }
+         }
+      }
+   );
+   $self->{outwatcher} = Event->timer(
+      parked => 1,
+      desc => "Modem sound output for $self->{line}",
+      cb => sub {
+         my $w = $_[0]->w;
+         my $l;
+         unless (length $self->{rawoutput}) {
+            my $q = $self->{play_queue};
+            if (@$q) {
+               #$self->slog(7, "(out $q->[0])");
+               if (ref \($q->[0]) eq "GLOB") {
+                  my $n;
+                  $l = sysread $q->[0], $self->{rawoutput}, $self->{FRAG};
+                  #$self->slog(7, "reading from file ($l bytes)\n");#d#
+                  $self->{rawoutput} =~ s/$DLE/$DLE$DLE/go;
+                  if ($l <= 0) {
+                    #$self->slog(7, "EOTX\n");#d#
+                    $self->event(EOTX, scalar@$q);
+                    shift @$q;
+                  }
+               } else {
+                  $self->{rawoutput} = ${shift(@$q)};
+               }
+            } else {
+               $w->stop;
+               $self->event(EOTX, 0);
+               return;
+            }
+         }
+         if (length $self->{rawoutput}) {
+            #$self->slog(7, "(send ".(length $self->{rawoutput})." bytes)");
+            $l = syswrite $self->{fh}, $self->{rawoutput}, length $self->{rawoutput};
+            #$self->slog(7, "(sent $l bytes)");
+            substr($self->{rawoutput}, 0, $l) = "" if $l > 0;
+            if (defined $l) {
+               $l /= $self->{HZ}; #/
+            } else {
+               $l = 0.1;
+            }
+            $self->{vtx_end} += $l;
+         }
+         $w->at($self->{vtx_end} - 0.01);
+         $w->start;
+      }
+   );
+
    $self->{tio}->setispeed($self->{speed});
    $self->{tio}->setospeed($self->{speed});
+
    $self->{ring}=0;
 }
 
@@ -364,11 +375,11 @@ sub accept {
    if ($self->command("ATA") =~ /^VCON/) {
       $self->slog(2, "call accepted (callerid $self->{callerid})");
       if ($self->command("AT+VTX+VRX") =~ /^CONNECT/) {
-         $self->{vtx_end} = time;
          $self->{state} |= VCON|VTX|VRX;
          delete $self->{event};
          $self->event(CONNECT);
          $self->{connect_cb}->($self);
+         delete $self->{event};
       } else {
          $self->rung;
          $self->abort;
@@ -385,12 +396,12 @@ sub check_break {
    while(my($k,$v) = each %{$self->{context}}) {
       if ($self->{break} =~ /$k/) {
          ref $v eq "CODE" ? $v->($self, $self->{break})
-                          : $self->event (BREAK, $v);
+                          : $self->event(BREAK, $v);
       }
    }
 }
 
-sub hangup {
+sub hangup {;
    my $self=shift;
    $self->event(undef) if $self->connected;
    $self->abort;
@@ -425,9 +436,10 @@ sub event {
 }
 
 sub play_file($$) {
-   my $self=shift;
-   my $path=shift;
-   my($fh)=local *FH;
+   my $self = shift;
+   my $path = shift;
+   my $fh = do { local *FH };
+   $self->slog(5, "play_file $path");
    open $fh,"<$path" or croak "unable to open ulaw file '$path' for playing";
    $self->play_object($fh);
 }
@@ -443,12 +455,16 @@ sub play_object($$) {
    my $self=shift;
    my $obj=shift;
    $self->{state} & VCON or return;
-   $self->{outwatcher}->start unless @{$self->{play_queue}};
-   push(@{$self->{play_queue}},$obj);
+   unless ($self->{outwatcher}->is_active) {
+      $self->{outwatcher}->at($self->{vtx_end} = time);
+      $self->{outwatcher}->start;
+   }
+   push @{$self->{play_queue}}, $obj;
 }
 
 sub play_pause($$) {
    my $self=shift;
+   $self->slog(5, "play_pause $_[0]");
    my $len = int($self->{HZ}*$_[0]+0.999);
    my $k8  = "\xFE" x $PFRAG;
    while ($len>length($k8)) {

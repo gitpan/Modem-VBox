@@ -3,10 +3,36 @@
 use Modem::VBox;
 use Sys::Syslog;
 
-eval {
-   require NetServer::ProcessTop;
-   NetServer::ProcessTop->new(7000);
-};
+$SIG{HUP} = 'IGNORE';
+
+sub send_file {
+   my ($subject, $filename, $mailto) = @_;
+   if (fork == 0) {
+      require POSIX;
+      require MIME::Entity;
+
+      $top = MIME::Entity->build(Type    =>"multipart/mixed",
+                                 From    => "vbox\@plan9.de",
+                                 To      => $mailto,
+                                 Subject => $subject);
+
+      $top->attach(
+         Path        => $filename,
+         Type        => "application/vbox",
+         Encoding    => "base64",
+      );
+
+      open MAIL, "| /usr/sbin/exim -t -oi -oem" or die "open: $!";
+      $top->print(\*MAIL);
+      close MAIL;
+      POSIX::_exit(0);
+   }
+}
+
+#{
+#   require NetServer::ProcessTop;
+#   NetServer::ProcessTop->new(7000);
+#};
 
 Sys::Syslog::setlogsock "unix";
 openlog "vbox", "cons,ndelay", "user";
@@ -19,21 +45,21 @@ $BASE="/var/spool/vbox";
 $MSG="$BASE/messages";
 $INC="$BASE/incoming";
 
-$Modem::VBox::debug=9;
+$SIG{CHLD} = 'IGNORE';
 
 sub num { sprintf "$MSG/_%d", shift }
 sub msg { "$MSG/$_[0]" }
 
 $v = new Modem::VBox
    line => $ARGV[0] || "/dev/ttyI1",
-   modeminit => 'ATZ&D2&B512&E9377344S13.4=0S13.2=1S13.6=0+FCLASS=8',
+   modeminit => 'ATZ&D2&B512&E9377358S13.4=0S13.2=1S13.6=0+FCLASS=8',
    rings => 5, # connect after 5 rings
    connect_cb => \&main_menu,
    ring_cb => sub {
       my ($count, $cid) = @_;
       my ($name, $avon);
       if ($count == 1) {
-         fork || do { exec "/etc/rc.spinup"; exit };
+         fork == 0 and do { exec "/etc/rc.spinup"; exit };
          open PHONE, "</var/spool/vbox/phone" and do {
             my $pm = qr/^$cid\s+(.*)/;
             while(<PHONE>) {
@@ -92,13 +118,17 @@ sub record_menu {
                        "", "",
                        "", "";
 
-         syslog "notice", "MESG: %s %s (%s)", $self->{phone}, $self->{name}, $self->{avon};
+         syslog "notice", "MESG+ %s %s (%s)", $v->{phone}, $v->{name}, $v->{avon};
 
          open FILE, ">$savename" or die "unable to create $savename: $!";
          print FILE $va;
          $v->play_drain;
          $v->record_file (*FILE);
-         do {} while $v->event;
+         do { } while $v->event;
+         close FILE;
+
+         send_file("MESG $v->{phone}=$v->{name} ($v->{avon})", $savename, "root\@plan9.de");
+         syslog "notice", "MESG- %s %s (%s)", $v->{phone}, $v->{name}, $v->{avon};
          return;
       }
    }
